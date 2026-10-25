@@ -1,0 +1,60 @@
+name: stg-cron
+
+# 서비스의 정기 처리 주소를 외부에서 호출한다.
+# 호출 주소와 인증 값은 저장소 Secrets 에만 둔다: STG_BASE_URL, CRON_SECRET.
+on:
+  # 시각은 UTC(한국 시각 -9시간).
+  schedule:
+    - cron: "*/5 * * * *"    # send-notifications
+    - cron: "*/10 * * * *"   # reconcile-payments, release-suspensions
+    - cron: "*/15 * * * *"   # account-suspend-retry
+    - cron: "10 4 * * *"     # process-account-deletions (한국 13:10)
+  workflow_dispatch:
+    inputs:
+      path:
+        description: "호출할 크론 경로(수동 1회)"
+        type: choice
+        default: send-notifications
+        options:
+          - send-notifications
+          - reconcile-payments
+          - release-suspensions
+          - account-suspend-retry
+          - process-account-deletions
+
+permissions: {}
+
+jobs:
+  call:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    # 같은 경로가 겹쳐 돌지 않게 한다(중복 발송 방지는 서버의 claim 이 따로 보장)
+    concurrency:
+      group: stg-cron-${{ github.event.schedule || inputs.path }}
+      cancel-in-progress: false
+    env:
+      BASE_URL: ${{ secrets.STG_BASE_URL }}
+      CRON_SECRET: ${{ secrets.CRON_SECRET }}
+      SCHEDULE: ${{ github.event.schedule }}
+      DISPATCH_PATH: ${{ inputs.path }}
+    steps:
+      - name: Call cron routes
+        shell: bash
+        run: |
+          set -u
+          if [ -z "${BASE_URL:-}" ] || [ -z "${CRON_SECRET:-}" ]; then echo "Secrets 가 비어 있습니다(STG_BASE_URL, CRON_SECRET)"; exit 1; fi
+          case "$SCHEDULE" in
+            "*/5 * * * *")   PATHS="send-notifications" ;;
+            "*/10 * * * *")  PATHS="reconcile-payments release-suspensions" ;;
+            "*/15 * * * *")  PATHS="account-suspend-retry" ;;
+            "10 4 * * *")    PATHS="process-account-deletions" ;;
+            "")              PATHS="$DISPATCH_PATH" ;;
+            *)               echo "알 수 없는 스케줄"; exit 1 ;;
+          esac
+          FAIL=0
+          for P in $PATHS; do
+            CODE=$(curl -sS -o resp.txt -w "%{http_code}" --max-time 55 -H "Authorization: Bearer ${CRON_SECRET}" "${BASE_URL}/api/cron/${P}" || echo "000")
+            echo "${P} -> HTTP ${CODE}"
+            if [ "$CODE" != "200" ]; then FAIL=1; fi
+          done
+          exit $FAIL
